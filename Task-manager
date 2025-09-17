@@ -1,0 +1,495 @@
+import sys
+import os
+import json
+import threading
+import subprocess
+import time as time_module
+from datetime import date, datetime, time, timedelta
+
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QListWidget, QListWidgetItem, QDialog,
+    QLineEdit, QComboBox, QDialogButtonBox, QFrame, QMessageBox,
+    QGraphicsDropShadowEffect, QStatusBar, QMenu
+)
+from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QAction
+
+# --- Configuration ---
+TASKS_FILE = "tasks.json"
+REMINDER_TIME = time(21, 0) # 9:00 PM
+DAILY_LIMITS = {"Hard": 1, "Normal": 3, "Easy": 5}
+LEVEL_SORT_ORDER = {"Hard": 0, "Normal": 1, "Easy": 2}
+LEVEL_COLORS = {"Hard": "#b48ead", "Normal": "#ebcb8b", "Easy": "#88c0d0"}
+
+# --- Nord Theme Stylesheet ---
+STYLESHEET = """
+    #MainWindow, #AddTaskDialog {
+        background-color: #2e3440;
+    }
+    QLabel {
+        color: #d8dee9;
+        font-size: 14px;
+    }
+    #HeaderLabel {
+        font-size: 24px;
+        font-weight: bold;
+        color: #eceff4;
+    }
+    #CountLabel {
+        color: #88c0d0;
+        font-size: 12px;
+        font-weight: bold;
+    }
+    QPushButton {
+        background-color: #4c566a;
+        color: #eceff4;
+        border: none;
+        padding: 10px 15px;
+        font-size: 14px;
+        font-weight: bold;
+        border-radius: 5px;
+    }
+    QPushButton#NavButton {
+        font-size: 20px;
+        padding: 5px 12px;
+    }
+    QPushButton:hover {
+        background-color: #5e81ac;
+    }
+    #TaskItemWidget_Important {
+        border: 2px solid #bf616a;
+        border-radius: 5px;
+    }
+    QListWidget {
+        background-color: #3b4252;
+        border: 1px solid #434c5e;
+        border-radius: 5px;
+        font-size: 16px;
+    }
+    QListWidget::item {
+        border-radius: 5px;
+    }
+    QListWidget::item:hover {
+        background-color: #434c5e;
+    }
+    QListWidget::item:selected {
+        background-color: #5e81ac;
+    }
+    QLineEdit, QComboBox {
+        background-color: #434c5e;
+        color: #d8dee9;
+        border: 1px solid #4c566a;
+        border-radius: 5px;
+        padding: 8px;
+        font-size: 14px;
+    }
+    QComboBox::drop-down { border: none; }
+    QStatusBar { color: #d8dee9; font-size: 12px; }
+    QMenu { background-color: #3b4252; color: #d8dee9; border: 1px solid #4c566a; }
+    QMenu::item:selected { background-color: #5e81ac; }
+"""
+
+# --- Custom Widget for Task Items ---
+class TaskItemWidget(QWidget):
+    """A custom widget to display a single task in the list."""
+    def __init__(self, task):
+        super().__init__()
+        self.task = task
+        
+        # Set object name for specific styling (important tasks)
+        if task.get('priority') == 'Important':
+            self.setObjectName("TaskItemWidget_Important")
+
+        self.setStyleSheet(f"background-color: {LEVEL_COLORS.get(task.get('level'))};")
+        
+        layout = QHBoxLayout()
+        layout.setContentsMargins(15, 10, 15, 10)
+        
+        self.name_label = QLabel(task.get('name'))
+        font = QFont()
+        font.setPixelSize(16)
+
+        # Build stylesheet for the name label for better visibility
+        style_parts = ["background-color: transparent;"]
+        if task.get('status') == 'Done':
+            font.setStrikeOut(True)
+            style_parts.append("color: #a3be8c;") # Greenish color for done
+            style_parts.append("text-decoration: line-through;")
+        elif task.get('priority') == 'Important':
+            style_parts.append("color: #bf616a;") # Red color for important
+            style_parts.append("font-weight: bold;")
+        else:
+            style_parts.append("color: #eceff4;") # Default text color
+
+        self.name_label.setStyleSheet(" ".join(style_parts))
+        self.name_label.setFont(font)
+            
+        level = task.get('level', 'Normal')
+        level_badge = QLabel(level)
+        level_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        level_badge.setStyleSheet(f"""
+            background-color: #2e3440; color: #d8dee9; padding: 4px 8px;
+            border-radius: 10px; font-weight: bold; font-size: 12px;
+        """)
+
+        status_label = QLabel(task.get('status'))
+        status_label.setStyleSheet("background-color: transparent; font-style: italic; color: #d8dee9;")
+
+        layout.addWidget(self.name_label)
+        layout.addStretch()
+        layout.addWidget(level_badge)
+        layout.addWidget(status_label)
+        self.setLayout(layout)
+
+# --- Add Task Dialog (No changes) ---
+class AddTaskDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("AddTaskDialog")
+        self.setWindowTitle("Add New Task")
+        self.setMinimumSize(400, 250)
+        layout = QVBoxLayout(self)
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("Enter task name...")
+        layout.addWidget(QLabel("Task Name:"))
+        layout.addWidget(self.name_input)
+        self.priority_input = QComboBox()
+        self.priority_input.addItems(["Not Important", "Important"])
+        layout.addWidget(QLabel("Priority:"))
+        layout.addWidget(self.priority_input)
+        self.level_input = QComboBox()
+        self.level_input.addItems(["Easy", "Normal", "Hard"])
+        self.level_input.setCurrentText("Normal")
+        layout.addWidget(QLabel("Level:"))
+        layout.addWidget(self.level_input)
+        layout.addStretch()
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_task_data(self):
+        return { "name": self.name_input.text(), "priority": self.priority_input.currentText(),
+                 "level": self.level_input.currentText(), "status": "Not Started" }
+
+# --- Main Application Window ---
+class TaskManagerWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("MainWindow")
+        self.setWindowTitle("PyQt Task Manager")
+        self.setGeometry(100, 100, 900, 700)
+
+        self.current_date = date.today()
+        self.tasks_data = self.read_tasks()
+
+        self.setup_ui()
+        self.create_actions()
+        self.update_view_for_date()
+        
+        reminder_thread = threading.Thread(target=self.run_reminder_check, daemon=True)
+        reminder_thread.start()
+
+    def setup_ui(self):
+        central_widget = QWidget()
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        
+        # --- Header with Date Navigation ---
+        header_layout = QHBoxLayout()
+        self.header_label = QLabel()
+        self.header_label.setObjectName("HeaderLabel")
+        self.header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        prev_day_btn = QPushButton("<")
+        prev_day_btn.setObjectName("NavButton")
+        prev_day_btn.clicked.connect(self.prev_day)
+        
+        today_btn = QPushButton("Today")
+        today_btn.clicked.connect(self.go_to_today)
+
+        next_day_btn = QPushButton(">")
+        next_day_btn.setObjectName("NavButton")
+        next_day_btn.clicked.connect(self.next_day)
+
+        header_layout.addWidget(prev_day_btn)
+        header_layout.addWidget(today_btn)
+        header_layout.addWidget(next_day_btn)
+        header_layout.addStretch(1)
+        header_layout.addWidget(self.header_label, 2)
+        header_layout.addStretch(1)
+        main_layout.addLayout(header_layout)
+        
+        # --- Task Counts ---
+        counts_layout = QHBoxLayout()
+        self.hard_count_label = QLabel()
+        self.normal_count_label = QLabel()
+        self.easy_count_label = QLabel()
+        self.hard_count_label.setObjectName("CountLabel")
+        self.normal_count_label.setObjectName("CountLabel")
+        self.easy_count_label.setObjectName("CountLabel")
+        counts_layout.addStretch()
+        counts_layout.addWidget(self.hard_count_label)
+        counts_layout.addWidget(self.normal_count_label)
+        counts_layout.addWidget(self.easy_count_label)
+        counts_layout.addStretch()
+        main_layout.addLayout(counts_layout)
+
+        # Search Bar
+        self.search_bar = QLineEdit()
+        self.search_bar.setPlaceholderText("Search tasks...")
+        self.search_bar.textChanged.connect(self.filter_tasks)
+        main_layout.addWidget(self.search_bar)
+
+        # Task List
+        self.task_list_widget = QListWidget()
+        self.task_list_widget.setSpacing(5)
+        self.task_list_widget.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        self.task_list_widget.model().rowsMoved.connect(self.on_task_moved)
+        self.task_list_widget.itemDoubleClicked.connect(self.edit_task_name)
+        
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(15)
+        shadow.setColor(QColor(0, 0, 0, 150))
+        shadow.setOffset(0, 2)
+        self.task_list_widget.setGraphicsEffect(shadow)
+        main_layout.addWidget(self.task_list_widget)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        self.add_btn = QPushButton("Add Task")
+        self.remove_btn = QPushButton("Remove Selected")
+        self.toggle_btn = QPushButton("Toggle Status")
+        
+        button_layout.addWidget(self.add_btn)
+        button_layout.addWidget(self.remove_btn)
+        button_layout.addStretch()
+        button_layout.addWidget(self.toggle_btn)
+        main_layout.addLayout(button_layout)
+        
+        self.setCentralWidget(central_widget)
+        self.setStatusBar(QStatusBar(self))
+        self.task_list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.task_list_widget.customContextMenuRequested.connect(self.show_context_menu)
+
+    # --- Actions and Interactivity ---
+    def create_actions(self):
+        # Icons and connections
+        self.add_btn.setIcon(QIcon.fromTheme("list-add"))
+        self.remove_btn.setIcon(QIcon.fromTheme("list-remove"))
+        self.toggle_btn.setIcon(QIcon.fromTheme("view-refresh"))
+        self.add_btn.clicked.connect(self.show_add_task_dialog)
+        self.remove_btn.clicked.connect(self.remove_task)
+        self.toggle_btn.clicked.connect(self.toggle_task_status)
+        
+        # Keyboard Shortcuts
+        add_action = QAction("Add Task", self, shortcut="Ctrl+N", triggered=self.show_add_task_dialog)
+        remove_action = QAction("Remove Task", self, shortcut="Delete", triggered=self.remove_task)
+        toggle_action = QAction("Toggle Status", self, shortcut="Ctrl+T", triggered=self.toggle_task_status)
+        self.addActions([add_action, remove_action, toggle_action])
+
+    def populate_task_list(self):
+        current_date_str = self.current_date.isoformat()
+        current_selection = self.task_list_widget.currentRow()
+        self.task_list_widget.clear()
+        
+        tasks_for_day = self.tasks_data.get(current_date_str, [])
+        # --- Automatic Sorting ---
+        sorted_tasks = sorted(tasks_for_day, key=lambda t: LEVEL_SORT_ORDER.get(t['level'], 99))
+        self.tasks_data[current_date_str] = sorted_tasks # Update data model with sorted list
+
+        for task in sorted_tasks:
+            item_widget = TaskItemWidget(task)
+            list_item = QListWidgetItem(self.task_list_widget)
+            list_item.setSizeHint(item_widget.sizeHint())
+            self.task_list_widget.addItem(list_item)
+            self.task_list_widget.setItemWidget(list_item, item_widget)
+        
+        if 0 <= current_selection < self.task_list_widget.count():
+            self.task_list_widget.setCurrentRow(current_selection)
+
+        self.update_task_counts_display()
+        self.filter_tasks()
+
+    def update_view_for_date(self):
+        """Updates the entire UI based on the self.current_date."""
+        self.header_label.setText(self.current_date.strftime("%A, %B %d, %Y"))
+        self.populate_task_list()
+        
+        is_read_only = self.current_date < date.today()
+        # Enable/disable controls based on date
+        self.add_btn.setEnabled(not is_read_only)
+        self.remove_btn.setEnabled(not is_read_only)
+        self.toggle_btn.setEnabled(not is_read_only)
+        self.task_list_widget.setDragDropMode(
+            QListWidget.DragDropMode.NoDragDrop if is_read_only else QListWidget.DragDropMode.InternalMove
+        )
+        if is_read_only:
+            self.statusBar().showMessage(f"Viewing past tasks (read-only).", 3000)
+        else:
+            self.statusBar().clearMessage()
+
+    # --- Date Navigation ---
+    def prev_day(self):
+        self.current_date -= timedelta(days=1)
+        self.update_view_for_date()
+    def next_day(self):
+        self.current_date += timedelta(days=1)
+        self.update_view_for_date()
+    def go_to_today(self):
+        self.current_date = date.today()
+        self.update_view_for_date()
+    
+    # --- Task Logic ---
+    def show_add_task_dialog(self):
+        current_date_str = self.current_date.isoformat()
+        dialog = AddTaskDialog(self)
+        if dialog.exec():
+            new_task = dialog.get_task_data()
+            if not new_task['name'].strip():
+                QMessageBox.warning(self, "Invalid Input", "Task name cannot be empty.")
+                return
+
+            counts = self.get_task_counts()
+            level = new_task['level']
+            if counts.get(level, 0) >= DAILY_LIMITS.get(level, 0):
+                QMessageBox.warning(self, "Limit Reached", f"Daily limit for '{level}' tasks has been reached.")
+                return
+
+            if current_date_str not in self.tasks_data:
+                self.tasks_data[current_date_str] = []
+            
+            self.tasks_data[current_date_str].append(new_task)
+            self.save_and_refresh()
+            self.statusBar().showMessage(f"Task '{new_task['name']}' added.", 3000)
+
+    def remove_task(self):
+        current_date_str = self.current_date.isoformat()
+        current_row = self.task_list_widget.currentRow()
+        if current_row >= 0:
+            task_name = self.tasks_data[current_date_str][current_row]['name']
+            del self.tasks_data[current_date_str][current_row]
+            self.save_and_refresh()
+            self.statusBar().showMessage(f"Task '{task_name}' removed.", 3000)
+
+    def toggle_task_status(self):
+        current_date_str = self.current_date.isoformat()
+        current_row = self.task_list_widget.currentRow()
+        if current_row >= 0:
+            task = self.tasks_data[current_date_str][current_row]
+            statuses = ["Not Started", "Doing", "Done"]
+            current_index = statuses.index(task.get('status', 'Not Started'))
+            task['status'] = statuses[(current_index + 1) % len(statuses)]
+            self.save_and_refresh()
+
+    def edit_task_name(self, item):
+        if self.current_date < date.today(): return # Prevent editing past tasks
+        row = self.task_list_widget.row(item)
+        current_name = self.tasks_data[self.current_date.isoformat()][row]['name']
+        
+        editor = QLineEdit(self.task_list_widget)
+        editor.setText(current_name)
+        editor.setFrame(False)
+        editor.editingFinished.connect(lambda: self.on_editing_finished(editor, row))
+        
+        self.task_list_widget.setItemWidget(item, editor)
+        editor.setFocus()
+
+    def on_editing_finished(self, editor, row):
+        new_name = editor.text().strip()
+        if new_name:
+            self.tasks_data[self.current_date.isoformat()][row]['name'] = new_name
+        self.save_and_refresh()
+
+    def on_task_moved(self, parent, start, end, dest, row):
+        tasks = self.tasks_data.get(self.current_date.isoformat(), [])
+        moved_item = tasks.pop(start)
+        tasks.insert(row, moved_item)
+        self.save_and_refresh()
+
+    def filter_tasks(self):
+        search_text = self.search_bar.text().lower()
+        for i in range(self.task_list_widget.count()):
+            item = self.task_list_widget.item(i)
+            widget = self.task_list_widget.itemWidget(item)
+            task_name = widget.task.get('name', '').lower()
+            item.setHidden(search_text not in task_name)
+            
+    def show_context_menu(self, pos):
+        item = self.task_list_widget.itemAt(pos)
+        if item and self.current_date >= date.today():
+            menu = QMenu(self)
+            edit_action = menu.addAction("Edit Task Name")
+            toggle_action = menu.addAction("Toggle Status")
+            menu.addSeparator()
+            remove_action = menu.addAction("Remove Task")
+            
+            action = menu.exec(self.task_list_widget.mapToGlobal(pos))
+            if action == edit_action: self.edit_task_name(item)
+            elif action == toggle_action: self.toggle_task_status()
+            elif action == remove_action: self.remove_task()
+
+    # --- Data Handling & UI Updates ---
+    def save_and_refresh(self):
+        self.write_tasks(self.tasks_data)
+        self.populate_task_list()
+
+    def get_task_counts(self):
+        counts = {"Hard": 0, "Normal": 0, "Easy": 0}
+        for task in self.tasks_data.get(self.current_date.isoformat(), []):
+            if task['level'] in counts:
+                counts[task['level']] += 1
+        return counts
+
+    def update_task_counts_display(self):
+        counts = self.get_task_counts()
+        self.hard_count_label.setText(f"Hard: {counts['Hard']}/{DAILY_LIMITS['Hard']}")
+        self.normal_count_label.setText(f"Normal: {counts['Normal']}/{DAILY_LIMITS['Normal']}")
+        self.easy_count_label.setText(f"Easy: {counts['Easy']}/{DAILY_LIMITS['Easy']}")
+
+    # --- File I/O and Reminder (No changes) ---
+    def read_tasks(self):
+        if not os.path.exists(TASKS_FILE): return {}
+        try:
+            with open(TASKS_FILE, "r") as f: return json.load(f)
+        except (IOError, json.JSONDecodeError): return {}
+
+    def write_tasks(self, data):
+        try:
+            with open(TASKS_FILE, "w") as f: json.dump(data, f, indent=4)
+        except IOError: QMessageBox.critical(self, "Error", f"Could not save tasks to {TASKS_FILE}.")
+
+    def run_reminder_check(self):
+        while True:
+            now = datetime.now()
+            reminder_datetime = datetime.combine(now.date(), REMINDER_TIME)
+            if now >= reminder_datetime:
+                self.show_reminder_notification()
+                reminder_datetime = datetime.combine(now.date() + timedelta(days=1), REMINDER_TIME)
+            sleep_seconds = (reminder_datetime - now).total_seconds()
+            if sleep_seconds > 0: time_module.sleep(sleep_seconds)
+
+    def show_reminder_notification(self):
+        tasks = self.read_tasks()
+        unfinished = [t for t in tasks.get(date.today().isoformat(), []) if t.get('status') != 'Done']
+        title = "All Tasks Completed!" if not unfinished else "Task Reminder"
+        message = "Great job!" if not unfinished else f"You have {len(unfinished)} unfinished task(s)."
+        try:
+            subprocess.run(['notify-send', title, message, '-i', 'dialog-information'])
+        except FileNotFoundError: print("notify-send not found.")
+
+    def closeEvent(self, event):
+        self.save_and_refresh()
+        event.accept()
+
+# --- Application Entry Point ---
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyleSheet(STYLESHEET)
+    window = TaskManagerWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+
